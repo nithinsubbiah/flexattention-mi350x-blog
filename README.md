@@ -5,11 +5,6 @@ submission to [ROCm Blogs](https://rocm.blogs.amd.com/). Shared here for review 
 
 **Read the draft: [blog/flexattention-mi350x/README.md](blog/flexattention-mi350x/README.md)**
 
-## Leaving comments
-
-The draft is also open as a pull request, which is the easiest place to comment on specific lines:
-open the PR, go to **Files changed**, and click any line. General feedback is welcome as an issue.
-
 ## What the post covers
 
 Ten merged upstream changes — five in PyTorch Inductor, five in Triton — that improve FlexAttention
@@ -38,10 +33,3 @@ python bench/plot_landed.py 'run*.log' blog/flexattention-mi350x/images
 
 `aggregate_landed.py` prints the tables used in the post along with the observed spread;
 `plot_landed.py` renders the figures from the same logs, so the charts and tables cannot disagree.
-
-## Open items before submission
-
-- Author byline is a `TODO` placeholder in the front matter.
-- `thumbnail` currently points at the fp16 chart; ROCm posts normally use a designed cover image.
-- The Flash Attention parity comparison is cited from the upstream PR review and was not reproduced
-  here, since this build was compiled without the fused attention backends.
