@@ -10,9 +10,10 @@ autotuning that configuration comes from a per-architecture table of defaults.
 In this blog, we show that those defaults were leaving a large amount of MI350X performance
 unclaimed, and we walk through a series of changes to PyTorch Inductor and Triton that recover it.
 The largest single change is one number: the fp16 wavefront count. On the shapes we measured,
-correcting the ROCm defaults improves fp16 FlexAttention forward throughput by **2.1x to 3.0x**, and
-enabling software pipelining improves bf16 throughput by **1.11x to 1.18x**. All of the changes
-described here are merged into PyTorch and Triton upstream, and require no user-side code changes.
+correcting the ROCm defaults improves fp16 FlexAttention forward throughput by **2.1x to 3.0x**.
+That figure is the two changes combined; bf16, which only needed the pipelining half, gains **1.11x
+to 1.18x**. All of the changes described here are merged into PyTorch and Triton upstream, and
+require no user-side code changes.
 
 ## How Inductor configures the FlexAttention kernel
 
@@ -25,10 +26,12 @@ table keyed by architecture, data type, and head dimension.
 
 On CDNA these defaults matter a great deal, because `num_warps` interacts directly with the matrix
 cores. The MFMA instructions the FlexAttention template uses on CDNA4 produce a 32x32 output tile
-per wavefront, so the number of wavefronts determines how the query tile is divided, and whether
-that division matches the shape the matrix core computes natively. Since that depends on the
-matrix-core geometry of the particular part, the best value can differ from one architecture to the
-next — which is why these defaults are now maintained per architecture.
+per wavefront, and the wavefront count decides how Triton spreads those tiles over the work. Get it
+wrong and the instruction does not change — instead you can end up computing part of the attention
+twice, or shuffling intermediate results through shared memory between the two matrix multiplies. We
+take that apart below. Because it depends on the tile sizes and the matrix-core geometry of the
+particular part, the best value can differ from one architecture to the next, which is why these
+defaults are now maintained per architecture.
 
 ## Enabling software pipelining
 
@@ -81,9 +84,23 @@ execute them, `num_warps=8` issues 768 wave-MFMAs against 512 for `num_warps=4`.
 computing one of them twice costs. The layout round-trip shows up as 138 `ds_write` instructions
 against 9.
 
-The lesson generalizes: when a CDNA kernel underperforms at a given tile size, check how `BLOCK_M`,
-the MFMA tile height, and `num_warps` line up. Misaligning them does not buy a smaller instruction —
-it buys redundant matrix-core work and a detour through LDS.
+Is eight wavefronts intrinsically wrong for this tile? Probably not, and that is the more
+interesting reading. Triton chose a 2D split, `[4, 2]`, for P@V in this very kernel, so the
+machinery exists; had it chosen one for QK^T as well, there would be neither redundant work nor a
+layout conversion. We did not try to force that layout, so this is a hypothesis rather than a result
+— but if it holds, the right fix is in Triton's warp tiling rather than in every kernel's config
+table.
+
+Two caveats on scope. This analysis is of gfx950 codegen at one shape, and the layout choice is not
+a simple function of the tile: compiling `BLOCK_M=64` with eight wavefronts here still assigns `[8,
+1]` to QK^T, so the smaller tile does not obviously escape the problem. That matters because MI300X
+pairs `BLOCK_M=64` with eight wavefronts in the table below, and wins with it. Those defaults were
+tuned on that part; we have not analyzed its codegen, and we would not assume the mechanism
+transfers.
+
+The practical lesson still generalizes: when a CDNA kernel underperforms at a given tile size, check
+how `BLOCK_M`, the MFMA tile height, and `num_warps` line up. Misaligning them does not buy a
+smaller instruction — it buys redundant matrix-core work and a detour through LDS.
 
 Correcting the fp16 default to 4 ([pytorch#180720](https://github.com/pytorch/pytorch/pull/180720))
 changes a single value, with an outsized effect:
@@ -97,15 +114,20 @@ changes a single value, with an outsized effect:
 | 8192 | 128 | none | 337.7 | 637.2 | 1.89x |
 | 8192 | 128 | causal | 225.5 | 467.4 | 2.07x |
 
-Measured with `num_stages=2` in both columns, so this isolates the wavefront count alone.
+Measured with `num_stages=2` in both columns, so this isolates the wavefront count alone. Our sweep
+holds batch size at 1; the table in [pytorch#180720](https://github.com/pytorch/pytorch/pull/180720)
+covers batch 32 down to 1 at matching token counts and reports 1.61x to 2.03x throughout, so the
+effect is not an artifact of batch size.
 
 If you run FlexAttention in fp16 on MI350X, this arrives with a PyTorch update and there is nothing
-to switch on. The part worth dwelling on is what did *not* change. Dump the generated code for both
-configurations and the kernel body is identical; the only difference is the `num_warps` value it is
-compiled and launched with. All of that throughput was already available in the code Inductor emits.
-If you are tuning your own attention workload, that is the encouraging read — the same lever is
-exposed to you through `kernel_options` and `max-autotune`, and on CDNA it is worth pulling before
-you conclude you need to hand-write a kernel.
+to switch on. The part worth dwelling on is what did *not* change, and it is worth being precise
+about the level. Dump what Inductor emits for both configurations and the kernel body is identical;
+the only difference is the `num_warps` value it is compiled and launched with. Everything below that
+line is where the difference appears — as the previous section shows, the layouts and scheduling
+Triton derives from that one value are substantially different. Nothing about the attention
+algorithm had to be rewritten to get this throughput. If you are tuning your own attention workload,
+that is the encouraging read: the same lever is exposed to you through `kernel_options` and
+`max-autotune`, and on CDNA it is worth pulling before you conclude you need to hand-write a kernel.
 
 For a sense of the absolute level this reaches, the upstream review of the change reported the
 corrected configuration landing on par with an optimized standalone Flash Attention kernel. We did
@@ -114,25 +136,35 @@ not reproduce that comparison here; the PR has the details.
 ## One default table per architecture
 
 Once it was clear that gfx950 wanted different settings, the natural next step was to give each CDNA
-generation its own entry. MI300X (gfx942) and MI350X (gfx950) differ in ways that move the optimum,
-including LDS capacity per compute unit — 64 KB against 160 KB — and fp16 matrix throughput.
+generation its own entry. MI300X (gfx942) and MI350X (gfx950) differ in ways that can move the
+optimum — LDS capacity per compute unit is 64 KB against 160 KB, and fp16 matrix throughput differs
+— though we did not attribute the tuning outcome to either specifically.
 
 [pytorch#181283](https://github.com/pytorch/pytorch/pull/181283) splits the single ROCm table into
 per-architecture tables selected by device capability, falling back to a conservative configuration
-for targets without an entry. The resulting forward defaults, as `(BLOCK_M, BLOCK_N, num_stages,
+for targets without an entry. The full set of forward defaults, as `(BLOCK_M, BLOCK_N, num_stages,
 num_warps)`:
 
 | Data type | Head dim | MI300X (gfx942) | MI350X (gfx950) |
 |---|---|---|---|
 | bf16 | 64, 128 | 64, 64, 2, 8 | 128, 64, 2, 4 |
+| bf16 | 256 | 32, 64, 2, 8 | 32, 64, 2, 4 |
 | fp16 | 64, 128 | 64, 32, 1, 8 | 128, 64, 2, 4 |
+| fp16 | 256 | 32, 32, 1, 8 | 32, 64, 2, 4 |
 | fp32 | 64, 128 | 128, 32, 1, 4 | 128, 32, 1, 4 |
+| fp32 | 256 | 64, 16, 1, 4 | 64, 16, 1, 4 |
 
 MI300X prefers smaller tiles spread across more wavefronts; MI350X prefers larger tiles with fewer.
 The practical benefit of the split is that MI300X now carries its own validated entry rather than
 inheriting values tuned for a different part, and either architecture can be re-tuned later without
 regressing the other. If you are bringing up a new target, this table is where its entry belongs.
 The gfx950 values are unchanged by the split, so the numbers in this post are unaffected by it.
+
+One asymmetry is worth calling out, since it cuts against the pipelining section above: fp32 keeps
+`num_stages=1` on both architectures. fp32 was outside what we measured here — the work described in
+this post targeted the half-precision paths — so those entries were left alone rather than shown not
+to benefit. If you run fp32 attention on either part, that is an easy thing to check with
+`kernel_options` and a promising place to look.
 
 ## Reducing addressing overhead
 
@@ -147,16 +179,19 @@ Inductor's pointwise path the annotation is suppressed for kernels that use atom
 operations do not support them, and it can be turned off with
 `TORCHINDUCTOR_EMIT_POINTER_RANGE_32=0`.
 
-One caveat if you go looking for those controls: both live in `TritonKernel.codegen_kernel()`, which
-template kernels do not go through. `TritonTemplateKernel.jit_lines()` builds its own metadata and
-calls `config_of()` without the override, so today neither the flag nor the atomics suppression
-reaches the FlexAttention kernel itself. That is a gap worth closing upstream. It is benign on
-gfx950, where the backend lowers the atomic case to a real `buffer_atomic_add_f32`, but it does mean
-the documented escape hatch does not currently cover the kernel this post is about.
-
 [pytorch#178541](https://github.com/pytorch/pytorch/pull/178541) is the necessary follow-up.
 User-defined Triton kernels receive pointers whose bounds Inductor cannot reason about, so the
 annotation must be suppressed for them rather than assumed safe.
+
+### A gap in those two controls
+
+Worth knowing if you rely on either one: both are applied in `TritonKernel.codegen_kernel()`, which
+template kernels do not go through. `TritonTemplateKernel.jit_lines()` builds its own metadata and
+calls `config_of()` without the override, so today neither the environment flag nor the atomics
+suppression reaches the FlexAttention kernel itself — setting the flag to `0` leaves the template
+kernel fully annotated. It is benign on gfx950, where the backend lowers the atomic case to a real
+`buffer_atomic_add_f32`, but the escape hatch does not currently cover the kernel this post is
+about. Gating `config_of()` in `jit_lines()` the way `codegen_kernel()` does would close it.
 
 ## Compiler support in Triton
 
@@ -253,19 +288,36 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 B, H, S, D = 1, 16, 4096, 128
 q, k, v = (torch.randn(B, H, S, D, device="cuda", dtype=torch.float16) for _ in range(3))
-block_mask = create_block_mask(lambda b, h, q_idx, kv_idx: q_idx >= kv_idx, B, H, S, S,
+# None, None: the mask_mod ignores b and h, so one mask serves every batch and head.
+block_mask = create_block_mask(lambda b, h, q_idx, kv_idx: q_idx >= kv_idx, B, None, S, S,
                                device="cuda")
 
 compiled = torch.compile(flex_attention, fullgraph=True)
-out = compiled(q, k, v, block_mask=block_mask)
+out = compiled(q, k, v, block_mask=block_mask, scale=D**-0.5)
 ```
 
-To measure the improvement, time that call against one with the previous defaults pinned:
+To measure the improvement, time that call against one with the previous defaults pinned. This
+follows the protocol described above, which matters: without the clock ramp and the repeats, the
+same code understates throughput by 12–18% on an idle-clocked GPU.
 
 ```python
+import statistics
 import triton
 
-def bench(opts=None):
+def ramp_clocks(seconds=8.0):
+    """MI350X idles near 145 MHz; time nothing until it has reached boost clocks."""
+    import time
+    a = torch.randn(8192, 8192, device="cuda", dtype=torch.float16)
+    b = torch.randn(8192, 8192, device="cuda", dtype=torch.float16)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        for _ in range(20):
+            torch.mm(a, b)
+        torch.cuda.synchronize()
+    del a, b
+    torch.cuda.empty_cache()
+
+def bench(opts=None, reps=3):
     fn = torch.compile(
         lambda q, k, v: flex_attention(q, k, v, block_mask=block_mask, scale=D**-0.5,
                                        kernel_options=opts),
@@ -273,11 +325,15 @@ def bench(opts=None):
     )
     fn(q, k, v)
     torch.cuda.synchronize()
-    ms = triton.testing.do_bench(lambda: fn(q, k, v), warmup=200, rep=500,
-                                 return_mode="median")
+    ms = statistics.median(
+        triton.testing.do_bench(lambda: fn(q, k, v), warmup=200, rep=500,
+                                return_mode="median")
+        for _ in range(reps)
+    )
     valid = (S * S + S) / 2  # live score entries under a causal mask
     return 4 * B * H * D * valid / ms * 1e-9
 
+ramp_clocks()
 previous = {"BLOCK_M": 128, "BLOCK_N": 64, "num_stages": 1, "num_warps": 8}
 print(f"previous defaults: {bench(previous):.1f} TFLOP/s")
 print(f"current defaults : {bench():.1f} TFLOP/s")
