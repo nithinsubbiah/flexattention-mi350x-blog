@@ -75,6 +75,9 @@ LADDER = {
         ("pre-#176676", 1, 8),
         ("+#176676 pipelining", 2, 8),
         ("+#180720 warps (current)", 2, 4),
+        # Fourth cell of the (num_stages, num_warps) factorial. Not on the
+        # chronological ladder, but needed to show the two knobs interact.
+        ("stages=1 warps=4 (factorial cell)", 1, 4),
     ],
     torch.bfloat16: [
         ("pre-#176676", 1, 4),

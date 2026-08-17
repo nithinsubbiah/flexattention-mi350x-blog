@@ -39,9 +39,27 @@ python bench/plot_landed.py 'run*.log' blog/flexattention-mi350x/images
 `aggregate_landed.py` prints the tables used in the post along with the observed spread;
 `plot_landed.py` renders the figures from the same logs, so the charts and tables cannot disagree.
 
+## Review status
+
+The draft has been through an independent verification pass on gfx950 hardware. All 18 published
+data points re-measured within 0.02x of the reported speedups and ~1% on absolute TFLOP/s, and all
+ten referenced PRs were confirmed merged upstream. Three claims were corrected as a result:
+
+- the mechanism behind the `num_warps` result (it is redundant QK^T work plus an LDS layout
+  round-trip, not a smaller MFMA instruction),
+- the attribution of absolute throughput to the Triton buffer-op work (worth ~1.33x on causal fp16 at
+  head dim 128, so "the throughput does not rest on them" was wrong),
+- the `TORCHINDUCTOR_EMIT_POINTER_RANGE_32=0` escape hatch, which does not reach template kernels.
+
+The last one is an upstream gap rather than a documentation error: both that flag and the atomics
+suppression from #176675 are applied in `TritonKernel.codegen_kernel()`, which template kernels do not
+go through. Worth fixing in `TritonTemplateKernel.jit_lines()`.
+
 ## Open items before submission
 
-- Author byline is a `TODO` placeholder in the front matter.
-- `thumbnail` currently points at the fp16 chart; ROCm posts normally use a designed cover image.
+- No author byline yet.
+- ROCm Blogs submissions need a YAML front matter block (title, date, author, tags, category, and the
+  `myst.html_meta` fields) plus a cover image; neither is in the draft, which is kept as plain prose
+  for review.
 - The Flash Attention parity comparison is cited from the upstream PR review and was not reproduced
   here, since this build was compiled without the fused attention backends.
