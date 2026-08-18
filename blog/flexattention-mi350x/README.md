@@ -71,36 +71,46 @@ Compiling the fp16 head-dimension-128 kernel both ways, the two configurations i
 instruction, `v_mfma_f32_32x32x16_f16`, producing a 32x32 output tile per wavefront. What changes is
 how Triton spreads wavefronts across the kernel's two dot products.
 
-At `num_warps=4` a single layout is used throughout, `warpsPerCTA = [4, 1]`, and four wavefronts of
-32 rows tile `BLOCK_M=128` exactly. At `num_warps=8` two things go wrong. Triton assigns
-`warpsPerCTA = [8, 1]` to QK^T, so eight wavefronts cover 256 rows of a 128-row tile: the M
-dimension is covered twice over and that dot is computed redundantly. It then chooses a different
-layout, `[4, 2]`, for the P@V dot, so the softmax result has to be converted between layouts, which
-on AMD means a round-trip through LDS.
+Triton's AMD backend has a rule for exactly this pattern, in `planWarps`
+([AccelerateAMDMatmul.cpp](https://github.com/triton-lang/triton/blob/main/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp)).
+When one dot feeds the next — QK^T into P@V, the flash-attention shape — the *first* dot always gets
+`warpsPerCTA = {num_warps, 1}`. That is deliberate, and the comment says why: putting every
+wavefront on the M axis keeps each softmax row inside one wavefront, avoiding a cross-wavefront
+reduction, and it is meant to let the second dot reuse the same layout. The *second* dot then caps
+its M axis at `BLOCK_M / 32` — it will not spread more wavefronts down M than there are MFMA tiles —
+and puts whatever is left on the N axis.
 
-Both are countable in the assembly. Weighting static MFMA instructions by the wavefronts that
-execute them, `num_warps=8` issues 768 wave-MFMAs against 512 for `num_warps=4`. With `BLOCK_M=128`,
-`BLOCK_N=64` and head dimension 128 the two dots cost the same, so that 1.5x is precisely what
-computing one of them twice costs. The layout round-trip shows up as 138 `ds_write` instructions
-against 9.
+Those two rules only agree while `num_warps` is at most `BLOCK_M / 32`. At `BLOCK_M=128` that
+ceiling is four. Ask for eight and they diverge, and the kernel pays twice over. QK^T spreads eight
+wavefronts across a tile that four already cover, so the M dimension is covered twice and that dot
+is computed redundantly. Meanwhile the second dot picks `[4, 2]`, so the layout conversion that the
+first rule exists to prevent happens anyway — and on AMD that conversion round-trips through LDS.
 
-Is eight wavefronts intrinsically wrong for this tile? Probably not, and that is the more
-interesting reading. Triton chose a 2D split, `[4, 2]`, for P@V in this very kernel, so the
-machinery exists; had it chosen one for QK^T as well, there would be neither redundant work nor a
-layout conversion. We did not try to force that layout, so this is a hypothesis rather than a result
-— but if it holds, the right fix is in Triton's warp tiling rather than in every kernel's config
-table.
+Both costs are countable in the assembly. Weighting static MFMA instructions by the wavefronts that
+execute them, `num_warps=8` issues 768 wave-MFMAs against 512 for `num_warps=4`; with `BLOCK_M=128`,
+`BLOCK_N=64` and head dimension 128 the two dots cost the same, so that 1.5x is precisely the price
+of computing one of them twice. The conversion shows up as 138 `ds_write` instructions against 9.
 
-Two caveats on scope. This analysis is of gfx950 codegen at one shape, and the layout choice is not
-a simple function of the tile: compiling `BLOCK_M=64` with eight wavefronts here still assigns `[8,
-1]` to QK^T, so the smaller tile does not obviously escape the problem. That matters because MI300X
-pairs `BLOCK_M=64` with eight wavefronts in the table below, and wins with it. Those defaults were
-tuned on that part; we have not analyzed its codegen, and we would not assume the mechanism
-transfers.
+That model makes a falsifiable prediction — stay at or below the ceiling and both costs vanish
+regardless of tile size — so we compiled five combinations and read the layouts back:
 
-The practical lesson still generalizes: when a CDNA kernel underperforms at a given tile size, check
-how `BLOCK_M`, the MFMA tile height, and `num_warps` line up. Misaligning them does not buy a
-smaller instruction — it buys redundant matrix-core work and a detour through LDS.
+| `BLOCK_M` | `num_warps` | ceiling (`BLOCK_M / 32`) | layouts emitted | `ds_write` |
+|---|---|---|---|---|
+| 128 | 4 | 4 | `[4, 1]` | 9 |
+| 128 | 2 | 4 | `[2, 1]` | 17 |
+| 64 | 2 | 2 | `[2, 1]` | 9 |
+| 128 | 8 | 4 | `[8, 1]` and `[4, 2]` | 138 |
+| 64 | 8 | 2 | `[8, 1]` and `[2, 4]` | 136 |
+
+So the actionable rule on CDNA4 is simply `num_warps <= BLOCK_M / 32`, with equality to keep every
+wavefront busy. For `BLOCK_M=128` that is 4, which is exactly the value that landed.
+
+Two things this does not settle. The wider fix belongs in `planWarps` rather than in each kernel's
+config table, since the tail-dot cap is what breaks the head-dot rule's own goal — but we have not
+written that patch or measured it. And by this model MI300X's `BLOCK_M=64` with eight wavefronts, in
+the table below, sits on the wrong side of the same ceiling, yet it is the tuned default there. We
+have no MI300X to compile on, so we cannot say whether the same costs appear or are simply
+outweighed. It is a promising thing for someone with that hardware to check.
 
 Correcting the fp16 default to 4 ([pytorch#180720](https://github.com/pytorch/pytorch/pull/180720))
 changes a single value, with an outsized effect:
