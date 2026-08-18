@@ -163,8 +163,8 @@ The gfx950 values are unchanged by the split, so the numbers in this post are un
 One asymmetry is worth calling out, since it cuts against the pipelining section above: fp32 keeps
 `num_stages=1` on both architectures. fp32 was outside what we measured here — the work described in
 this post targeted the half-precision paths — so those entries were left alone rather than shown not
-to benefit. If you run fp32 attention on either part, that is an easy thing to check with
-`kernel_options` and a promising place to look.
+to benefit. If you run fp32 attention on either part, `kernel_options` makes that cheap to check for
+your own shapes.
 
 ## Reducing addressing overhead
 
