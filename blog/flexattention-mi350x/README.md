@@ -66,6 +66,25 @@ The larger gain came from the fp16 entries, which used `num_warps=8` at head dim
 while bf16 used 4 for the same shapes. On gfx950, 4 turns out to be the better choice at both head
 dimensions, and the difference is substantial.
 
+Correcting the fp16 default to 4 ([pytorch#180720](https://github.com/pytorch/pytorch/pull/180720))
+changes a single value, with an outsized effect:
+
+| Sequence length | Head dim | Mask | `num_warps=8` | `num_warps=4` | Speedup |
+|---|---|---|---|---|---|
+| 4096 | 64 | none | 233.9 | 508.0 | 2.17x |
+| 4096 | 64 | causal | 119.1 | 311.4 | 2.61x |
+| 4096 | 128 | none | 331.2 | 616.2 | 1.86x |
+| 4096 | 128 | causal | 187.0 | 402.7 | 2.15x |
+| 8192 | 128 | none | 337.7 | 637.2 | 1.89x |
+| 8192 | 128 | causal | 225.5 | 467.4 | 2.07x |
+
+Measured with `num_stages=2` in both columns, so this isolates the wavefront count alone. Our sweep
+holds batch size at 1; the table in [pytorch#180720](https://github.com/pytorch/pytorch/pull/180720)
+covers batch 32 down to 1 at matching token counts and reports 1.61x to 2.03x throughout, so the
+effect is not an artifact of batch size.
+
+### Why eight was the wrong number
+
 The cause is visible in the generated IR, and it is not that the matrix core does anything smaller.
 Compiling the fp16 head-dimension-128 kernel both ways, the two configurations issue the same
 instruction, `v_mfma_f32_32x32x16_f16`, producing a 32x32 output tile per wavefront. What changes is
@@ -112,32 +131,17 @@ the table below, sits on the wrong side of the same ceiling, yet it is the tuned
 have no MI300X to compile on, so we cannot say whether the same costs appear or are simply
 outweighed. It is a promising thing for someone with that hardware to check.
 
-Correcting the fp16 default to 4 ([pytorch#180720](https://github.com/pytorch/pytorch/pull/180720))
-changes a single value, with an outsized effect:
-
-| Sequence length | Head dim | Mask | `num_warps=8` | `num_warps=4` | Speedup |
-|---|---|---|---|---|---|
-| 4096 | 64 | none | 233.9 | 508.0 | 2.17x |
-| 4096 | 64 | causal | 119.1 | 311.4 | 2.61x |
-| 4096 | 128 | none | 331.2 | 616.2 | 1.86x |
-| 4096 | 128 | causal | 187.0 | 402.7 | 2.15x |
-| 8192 | 128 | none | 337.7 | 637.2 | 1.89x |
-| 8192 | 128 | causal | 225.5 | 467.4 | 2.07x |
-
-Measured with `num_stages=2` in both columns, so this isolates the wavefront count alone. Our sweep
-holds batch size at 1; the table in [pytorch#180720](https://github.com/pytorch/pytorch/pull/180720)
-covers batch 32 down to 1 at matching token counts and reports 1.61x to 2.03x throughout, so the
-effect is not an artifact of batch size.
+### What did not change
 
 If you run FlexAttention in fp16 on MI350X, this arrives with a PyTorch update and there is nothing
 to switch on. The part worth dwelling on is what did *not* change, and it is worth being precise
 about the level. Dump what Inductor emits for both configurations and the kernel body is identical;
 the only difference is the `num_warps` value it is compiled and launched with. Everything below that
-line is where the difference appears — as the previous section shows, the layouts and scheduling
-Triton derives from that one value are substantially different. Nothing about the attention
-algorithm had to be rewritten to get this throughput. If you are tuning your own attention workload,
-that is the encouraging read: the same lever is exposed to you through `kernel_options` and
-`max-autotune`, and on CDNA it is worth pulling before you conclude you need to hand-write a kernel.
+line is where the difference appears — as we just saw, the layouts and scheduling Triton derives
+from that one value are substantially different. Nothing about the attention algorithm had to be
+rewritten to get this throughput. If you are tuning your own attention workload, that is the
+encouraging read: the same lever is exposed to you through `kernel_options` and `max-autotune`, and
+on CDNA it is worth pulling before you conclude you need to hand-write a kernel.
 
 For a sense of the absolute level this reaches, the upstream review of the change reported the
 corrected configuration landing on par with an optimized standalone Flash Attention kernel. We did
@@ -382,11 +386,14 @@ that same shape. The two knobs interact, which is a good reason to tune them tog
 one at a time.
 
 If you are running FlexAttention on AMD hardware and your shapes or data types differ from the ones
-here, the defaults are a starting point rather than an answer. `mode="max-autotune"` will search the
-space for you, `kernel_options` will pin a configuration once you have found a good one, and if you
-find defaults that beat ours on a given part, the per-architecture table is now a straightforward
-place to contribute them.
+here, the defaults are a starting point rather than an answer. One rule transfers directly: on
+CDNA4, keep `num_warps` at or below `BLOCK_M / 32`. Past that ceiling Triton's two warp-layout rules
+disagree and the kernel pays for both redundant matrix-core work and a trip through LDS. Beyond
+that, `mode="max-autotune"` will search the space for you, `kernel_options` will pin a configuration
+once you have found a good one, and if you find defaults that beat ours on a given part, the
+per-architecture table is now a straightforward place to contribute them.
 
-There is more to do in two directions: the backward pass, whose configuration has received far less
-attention than the forward, and newer architectures, where that table gives validated defaults a
-clean home.
+There is more to do in three directions: the backward pass, whose configuration has received far
+less attention than the forward; newer architectures, where that table gives validated defaults a
+clean home; and `planWarps` itself, because a config table that has to steer around the compiler's
+warp tiling is a workaround rather than a fix.
