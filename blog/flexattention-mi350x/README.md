@@ -196,30 +196,27 @@ turned off with `TORCHINDUCTOR_EMIT_POINTER_RANGE_32=0`.
 User-defined Triton kernels receive pointers whose bounds Inductor cannot reason about, so the
 annotation must be suppressed for them rather than assumed safe.
 
-### A gap in those controls, and what it cost
+### A gap in those controls
 
 Both are applied in `TritonKernel.codegen_kernel()`, which template kernels do not go through:
 `TritonTemplateKernel.jit_lines()` builds its own metadata and calls `config_of()` without the
 override. So neither the environment flag nor the atomics suppression reached the FlexAttention
 kernel — setting the flag to `0` left the template kernel fully annotated.
 
-The atomics half of that turned out to matter enormously. A `score_mod` that captures a tensor
-requiring grad makes the backward accumulate into it with `tl.atomic_add`, and since the kernel was
-tagged anyway, the backend chose buffer atomics for that accumulation. The gradients are correct,
-but with a learnable per-head bias the backward ran in 425 ms where global atomics take 6.8 ms —
-**63x** — at `B=1, H=8, S=2048, D=64` in fp16.
+Most workloads never notice. Causal masks, sliding windows, document masking and constant
+soft-capping capture nothing that needs a gradient, and the forward pass is unaffected either way.
+Train with a *learnable* tensor in the `score_mod`, though, and the backward accumulates into it
+with `tl.atomic_add` — at which point the stray annotation let the backend choose buffer atomics for
+that accumulation. Gradients stayed correct, but with a learnable per-head bias the backward took
+425 ms against 6.8 ms for global atomics, at `B=1, H=8, S=2048, D=64` in fp16.
 
-The cause is contention rather than addressing. With `bias[h]`, all ~4.2M score positions in a head
-fold into one float, so eight addresses absorb the entire accumulation. Rewrite the mod as `bias[h,
-q_idx]`, spreading the same traffic over 16,384 addresses, and the gap collapses to 1.09x. Note
-which way that cuts: the smaller and more ordinary the learnable parameter, the harder it is hit. We
-did not establish why buffer atomics degrade so much further under contention than global ones, only
-that contention is the variable that controls it.
-
-[pytorch#194136](https://github.com/pytorch/pytorch/pull/194136) closes the gap, moving the decision
-into a single helper that both codegen paths call. It also records the atomics emitted by
-`ModificationWrapper.store()`, which bypasses `TritonKernel.store()` and so never marked the kernel
-as using them — without that, applying the guard to template kernels would have been a no-op.
+Contention sets the size of that penalty, not addressing. `bias[h]` funnels roughly 4.2M score
+positions per head into eight addresses; `bias[h, q_idx]` spreads the same traffic across 16,384 and
+the gap falls to 1.09x. Those are the only two points we measured, so treat 63x as the worst end of
+a range rather than a typical figure — though it leans the wrong way, since the smallest learnable
+parameters are both the most ordinary and the worst affected.
+[pytorch#194136](https://github.com/pytorch/pytorch/pull/194136) closes the gap upstream by moving
+the decision into one helper that both codegen paths call.
 
 ## Compiler support in Triton
 
