@@ -189,23 +189,37 @@ using its cheaper buffer load and store instructions.
 
 [pytorch#176675](https://github.com/pytorch/pytorch/pull/176675) makes Inductor emit
 `tt.pointer_range=32` on HIP for tensor arguments whose storage provably fits within 2 GB. On
-Inductor's pointwise path the annotation is suppressed for kernels that use atomics, since buffer
-operations do not support them, and it can be turned off with
-`TORCHINDUCTOR_EMIT_POINTER_RANGE_32=0`.
+Inductor's pointwise path the annotation is suppressed for kernels that use atomics, and it can be
+turned off with `TORCHINDUCTOR_EMIT_POINTER_RANGE_32=0`.
 
 [pytorch#178541](https://github.com/pytorch/pytorch/pull/178541) is the necessary follow-up.
 User-defined Triton kernels receive pointers whose bounds Inductor cannot reason about, so the
 annotation must be suppressed for them rather than assumed safe.
 
-### A gap in those two controls
+### A gap in those controls, and what it cost
 
-Worth knowing if you rely on either one: both are applied in `TritonKernel.codegen_kernel()`, which
-template kernels do not go through. `TritonTemplateKernel.jit_lines()` builds its own metadata and
-calls `config_of()` without the override, so today neither the environment flag nor the atomics
-suppression reaches the FlexAttention kernel itself — setting the flag to `0` leaves the template
-kernel fully annotated. It is benign on gfx950, where the backend lowers the atomic case to a real
-`buffer_atomic_add_f32`, but the escape hatch does not currently cover the kernel this post is
-about. Gating `config_of()` in `jit_lines()` the way `codegen_kernel()` does would close it.
+Both are applied in `TritonKernel.codegen_kernel()`, which template kernels do not go through:
+`TritonTemplateKernel.jit_lines()` builds its own metadata and calls `config_of()` without the
+override. So neither the environment flag nor the atomics suppression reached the FlexAttention
+kernel — setting the flag to `0` left the template kernel fully annotated.
+
+The atomics half of that turned out to matter enormously. A `score_mod` that captures a tensor
+requiring grad makes the backward accumulate into it with `tl.atomic_add`, and since the kernel was
+tagged anyway, the backend chose buffer atomics for that accumulation. The gradients are correct,
+but with a learnable per-head bias the backward ran in 425 ms where global atomics take 6.8 ms —
+**63x** — at `B=1, H=8, S=2048, D=64` in fp16.
+
+The cause is contention rather than addressing. With `bias[h]`, all ~4.2M score positions in a head
+fold into one float, so eight addresses absorb the entire accumulation. Rewrite the mod as `bias[h,
+q_idx]`, spreading the same traffic over 16,384 addresses, and the gap collapses to 1.09x. Note
+which way that cuts: the smaller and more ordinary the learnable parameter, the harder it is hit. We
+did not establish why buffer atomics degrade so much further under contention than global ones, only
+that contention is the variable that controls it.
+
+[pytorch#194136](https://github.com/pytorch/pytorch/pull/194136) closes the gap, moving the decision
+into a single helper that both codegen paths call. It also records the atomics emitted by
+`ModificationWrapper.store()`, which bypasses `TritonKernel.store()` and so never marked the kernel
+as using them — without that, applying the guard to template kernels would have been a no-op.
 
 ## Compiler support in Triton
 
